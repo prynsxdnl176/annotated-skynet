@@ -1,3 +1,8 @@
+/*
+ * skynet_socket.c - skynet网络接口层
+ * 提供skynet框架的网络功能接口，封装底层socket_server的操作
+ */
+
 #include "skynet.h"
 
 #include "skynet_socket.h"
@@ -11,30 +16,48 @@
 #include <string.h>
 #include <stdbool.h>
 
+// 全局socket服务器实例
 static struct socket_server * SOCKET_SERVER = NULL;
 
-void 
+/*
+ * 初始化socket系统
+ * 创建socket服务器实例
+ */
+void
 skynet_socket_init() {
 	SOCKET_SERVER = socket_server_create(skynet_now());
 }
 
+/*
+ * 退出socket系统
+ * 通知socket服务器准备退出
+ */
 void
 skynet_socket_exit() {
 	socket_server_exit(SOCKET_SERVER);
 }
 
+/*
+ * 释放socket系统资源
+ * 完全释放socket服务器实例
+ */
 void
 skynet_socket_free() {
 	socket_server_release(SOCKET_SERVER);
 	SOCKET_SERVER = NULL;
 }
 
+/*
+ * 更新socket系统时间
+ * 用于超时处理等时间相关功能
+ */
 void
 skynet_socket_updatetime() {
 	socket_server_updatetime(SOCKET_SERVER, skynet_now());
 }
 
 // mainloop thread
+// 主循环线程
 static void
 forward_message(int type, bool padding, struct socket_message * result) {
 	struct skynet_socket_message *sm;
@@ -70,6 +93,8 @@ forward_message(int type, bool padding, struct socket_message * result) {
 	if (skynet_context_push((uint32_t)result->opaque, &message)) {
 		// todo: report somewhere to close socket
 		// don't call skynet_socket_close here (It will block mainloop)
+		// 待办：在某处报告关闭socket
+		// 不要在这里调用skynet_socket_close（会阻塞主循环）
 		skynet_free(sm->buffer);
 		skynet_free(sm);
 	}

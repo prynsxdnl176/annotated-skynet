@@ -1,3 +1,8 @@
+/*
+ * malloc_hook.c - skynet内存分配钩子模块
+ * 提供内存使用统计和调试功能，支持按服务统计内存使用量
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -10,31 +15,42 @@
 #include "atomic.h"
 
 // turn on MEMORY_CHECK can do more memory check, such as double free
+// 开启MEMORY_CHECK可以进行更多内存检查，如双重释放检测
 // #define MEMORY_CHECK
 
-#define MEMORY_ALLOCTAG 0x20140605
-#define MEMORY_FREETAG 0x0badf00d
+// 内存标签定义
+#define MEMORY_ALLOCTAG 0x20140605  // 分配内存标签
+#define MEMORY_FREETAG 0x0badf00d   // 释放内存标签
 
-static ATOM_SIZET _used_memory = 0;
-static ATOM_SIZET _memory_block = 0;
+// 全局内存统计
+static ATOM_SIZET _used_memory = 0;   // 已使用内存总量
+static ATOM_SIZET _memory_block = 0;  // 内存块总数
 
+/*
+ * 服务内存统计数据结构
+ */
 struct mem_data {
-	ATOM_ULONG handle;
-	ATOM_SIZET allocated;
+	ATOM_ULONG handle;      // 服务handle
+	ATOM_SIZET allocated;   // 已分配内存大小
 };
 
+/*
+ * 内存块cookie结构
+ * 存储在每个分配内存块前面，用于统计和调试
+ */
 struct mem_cookie {
-	size_t size;
-	uint32_t handle;
+	size_t size;            // 内存块大小
+	uint32_t handle;        // 分配该内存的服务handle
 #ifdef MEMORY_CHECK
-	uint32_t dogtag;
+	uint32_t dogtag;        // 调试标签
 #endif
-	uint32_t cookie_size;	// should be the last
+	uint32_t cookie_size;   // cookie大小（必须是最后一个字段）
 };
 
-#define SLOT_SIZE 0x10000
-#define PREFIX_SIZE sizeof(struct mem_cookie)
+#define SLOT_SIZE 0x10000                    // 统计槽位数量
+#define PREFIX_SIZE sizeof(struct mem_cookie) // cookie前缀大小
 
+// 内存统计数组，按handle的低16位索引
 static struct mem_data mem_stats[SLOT_SIZE];
 
 
@@ -43,9 +59,15 @@ static struct mem_data mem_stats[SLOT_SIZE];
 #include "jemalloc.h"
 
 // for skynet_lalloc use
+// 为skynet_lalloc使用的原始内存分配函数
 #define raw_realloc je_realloc
 #define raw_free je_free
 
+/*
+ * 获取指定handle的内存分配统计字段
+ * @param handle: 服务handle
+ * @return: 指向分配内存统计的原子变量指针
+ */
 static ATOM_SIZET *
 get_allocated_field(uint32_t handle) {
 	int h = (int)(handle & (SLOT_SIZE - 1));
@@ -54,6 +76,7 @@ get_allocated_field(uint32_t handle) {
 	ssize_t old_alloc = (ssize_t)data->allocated;
 	if(old_handle == 0 || old_alloc <= 0) {
 		// data->allocated may less than zero, because it may not count at start.
+		// data->allocated可能小于零，因为在开始时可能没有计数
 		if(!ATOM_CAS_ULONG(&data->handle, old_handle, handle)) {
 			return 0;
 		}
@@ -67,23 +90,33 @@ get_allocated_field(uint32_t handle) {
 	return &data->allocated;
 }
 
+/*
+ * 更新内存分配统计信息
+ * @param handle: 分配内存的服务handle
+ * @param __n: 分配的内存大小
+ */
 inline static void
 update_xmalloc_stat_alloc(uint32_t handle, size_t __n) {
-	ATOM_FADD(&_used_memory, __n);
-	ATOM_FINC(&_memory_block);
+	ATOM_FADD(&_used_memory, __n);     // 增加全局内存使用量
+	ATOM_FINC(&_memory_block);         // 增加内存块计数
 	ATOM_SIZET * allocated = get_allocated_field(handle);
 	if(allocated) {
-		ATOM_FADD(allocated, __n);
+		ATOM_FADD(allocated, __n);     // 增加服务的内存使用量
 	}
 }
 
+/*
+ * 更新内存释放统计信息
+ * @param handle: 释放内存的服务handle
+ * @param __n: 释放的内存大小
+ */
 inline static void
 update_xmalloc_stat_free(uint32_t handle, size_t __n) {
-	ATOM_FSUB(&_used_memory, __n);
-	ATOM_FDEC(&_memory_block);
+	ATOM_FSUB(&_used_memory, __n);     // 减少全局内存使用量
+	ATOM_FDEC(&_memory_block);         // 减少内存块计数
 	ATOM_SIZET * allocated = get_allocated_field(handle);
 	if(allocated) {
-		ATOM_FSUB(allocated, __n);
+		ATOM_FSUB(allocated, __n);     // 减少服务的内存使用量
 	}
 }
 
@@ -120,6 +153,7 @@ clean_prefix(char* ptr) {
 		fprintf(stderr, "xmalloc: double free in :%08x\n", handle);
 	}
 	assert(dogtag == MEMORY_ALLOCTAG);	// memory out of bounds
+	// 内存越界检查
 	p->dogtag = MEMORY_FREETAG;
 #endif
 	update_xmalloc_stat_free(handle, p->size);
@@ -165,6 +199,7 @@ mallctl_int64(const char* name, size_t* newval) {
 		je_mallctl(name, &v, &len, NULL, 0);
 	}
 	// skynet_error(NULL, "name: %s, value: %zd\n", name, v);
+	// 调试输出：名称和值
 	return v;
 }
 
@@ -187,6 +222,7 @@ mallctl_opt(const char* name, int* newval) {
 }
 
 // hook : malloc, realloc, free, calloc
+// 钩子函数：malloc, realloc, free, calloc
 
 void *
 skynet_malloc(size_t size) {
@@ -264,6 +300,7 @@ skynet_posix_memalign(void **memptr, size_t alignment, size_t size) {
 #else
 
 // for skynet_lalloc use
+// 供skynet_lalloc使用
 #define raw_realloc realloc
 #define raw_free free
 
@@ -363,6 +400,7 @@ malloc_current_memory(void) {
 void
 skynet_debug_memory(const char *info) {
 	// for debug use
+	// 供调试使用
 	uint32_t handle = skynet_current_handle();
 	size_t mem = malloc_current_memory();
 	fprintf(stderr, "[:%08x] %s %p\n", handle, info, (void *)mem);
