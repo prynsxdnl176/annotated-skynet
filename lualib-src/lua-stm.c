@@ -11,70 +11,83 @@
 #include "skynet_malloc.h"
 #include "atomic.h"
 
+// STM（软件事务内存）对象结构
 struct stm_object {
-	struct rwlock lock;
-	ATOM_INT reference;
-	struct stm_copy * copy;
+	struct rwlock lock;     // 读写锁
+	ATOM_INT reference;     // 原子引用计数
+	struct stm_copy * copy; // 数据副本指针
 };
 
+// STM 数据副本结构
 struct stm_copy {
-	ATOM_INT reference;
-	uint32_t sz;
-	void * msg;
+	ATOM_INT reference;  // 原子引用计数
+	uint32_t sz;         // 数据大小
+	void * msg;          // 数据指针
 };
 
-// msg should alloc by skynet_malloc 
+// msg should alloc by skynet_malloc
+// 消息应该由 skynet_malloc 分配
+// 创建新的数据副本
 static struct stm_copy *
 stm_newcopy(void * msg, int32_t sz) {
 	struct stm_copy * copy = skynet_malloc(sizeof(*copy));
-	ATOM_INIT(&copy->reference, 1);
+	ATOM_INIT(&copy->reference, 1);  // 初始引用计数为1
 	copy->sz = sz;
 	copy->msg = msg;
 
 	return copy;
 }
 
+// 创建新的 STM 对象
 static struct stm_object *
 stm_new(void * msg, int32_t sz) {
 	struct stm_object * obj = skynet_malloc(sizeof(*obj));
-	rwlock_init(&obj->lock);
-	ATOM_INIT(&obj->reference , 1);
-	obj->copy = stm_newcopy(msg, sz);
+	rwlock_init(&obj->lock);         // 初始化读写锁
+	ATOM_INIT(&obj->reference , 1);  // 初始引用计数为1
+	obj->copy = stm_newcopy(msg, sz); // 创建初始副本
 
 	return obj;
 }
 
+// 释放数据副本
 static void
 stm_releasecopy(struct stm_copy *copy) {
 	if (copy == NULL)
 		return;
 	if (ATOM_FDEC(&copy->reference) <= 1) {
+		// 引用计数降到0，释放资源
 		skynet_free(copy->msg);
 		skynet_free(copy);
 	}
 }
 
+// 释放 STM 对象（写者调用）
 static void
 stm_release(struct stm_object *obj) {
 	assert(obj->copy);
-	rwlock_wlock(&obj->lock);
+	rwlock_wlock(&obj->lock);  // 获取写锁
 	// writer release the stm object, so release the last copy .
+	// 写者释放 STM 对象，所以释放最后的副本
 	stm_releasecopy(obj->copy);
 	obj->copy = NULL;
 	if (ATOM_FDEC(&obj->reference) > 1) {
 		// stm object grab by readers, reset the copy to NULL.
+		// STM 对象被读者持有，将副本重置为 NULL
 		rwlock_wunlock(&obj->lock);
 		return;
 	}
 	// no one grab the stm object, no need to unlock wlock.
+	// 没有人持有 STM 对象，无需解锁写锁
 	skynet_free(obj);
 }
 
+// 释放 STM 对象（读者调用）
 static void
 stm_releasereader(struct stm_object *obj) {
-	rwlock_rlock(&obj->lock);
+	rwlock_rlock(&obj->lock);  // 获取读锁
 	if (ATOM_FDEC(&obj->reference) == 1) {
 		// last reader, no writer. so no need to unlock
+		// 最后一个读者，没有写者，无需解锁
 		assert(obj->copy == NULL);
 		skynet_free(obj);
 		return;
@@ -82,20 +95,22 @@ stm_releasereader(struct stm_object *obj) {
 	rwlock_runlock(&obj->lock);
 }
 
+// 增加 STM 对象引用计数
 static void
 stm_grab(struct stm_object *obj) {
-	rwlock_rlock(&obj->lock);
-	int ref = ATOM_FINC(&obj->reference);
+	rwlock_rlock(&obj->lock);   // 获取读锁
+	int ref = ATOM_FINC(&obj->reference);  // 原子递增引用计数
 	rwlock_runlock(&obj->lock);
 	assert(ref > 0);
 }
 
+// 获取 STM 对象的数据副本
 static struct stm_copy *
 stm_copy(struct stm_object *obj) {
-	rwlock_rlock(&obj->lock);
+	rwlock_rlock(&obj->lock);   // 获取读锁
 	struct stm_copy * ret = obj->copy;
 	if (ret) {
-		int ref = ATOM_FINC(&ret->reference);
+		int ref = ATOM_FINC(&ret->reference);  // 增加副本引用计数
 		assert(ref > 0);
 	}
 	rwlock_runlock(&obj->lock);
@@ -234,33 +249,37 @@ lread(lua_State *L) {
 	}
 }
 
+// STM 模块初始化函数
 LUAMOD_API int
 luaopen_skynet_stm(lua_State *L) {
 	luaL_checkversion(L);
 	lua_createtable(L, 0, 3);
 
+	// 添加 copy 函数
 	lua_pushcfunction(L, lcopy);
 	lua_setfield(L, -2, "copy");
 
+	// 创建写者元表和函数
 	luaL_Reg writer[] = {
-		{ "new", lnewwriter },
+		{ "new", lnewwriter },  // 创建新写者
 		{ NULL, NULL },
 	};
 	lua_createtable(L, 0, 2);
-	lua_pushcfunction(L, ldeletewriter),
+	lua_pushcfunction(L, ldeletewriter),  // 垃圾回收方法
 	lua_setfield(L, -2, "__gc");
-	lua_pushcfunction(L, lupdate),
+	lua_pushcfunction(L, lupdate),        // 更新方法
 	lua_setfield(L, -2, "__call");
 	luaL_setfuncs(L, writer, 1);
 
+	// 创建读者元表和函数
 	luaL_Reg reader[] = {
-		{ "newcopy", lnewreader },
+		{ "newcopy", lnewreader },  // 创建新读者
 		{ NULL, NULL },
 	};
 	lua_createtable(L, 0, 2);
-	lua_pushcfunction(L, ldeletereader),
+	lua_pushcfunction(L, ldeletereader),  // 垃圾回收方法
 	lua_setfield(L, -2, "__gc");
-	lua_pushcfunction(L, lread),
+	lua_pushcfunction(L, lread),          // 读取方法
 	lua_setfield(L, -2, "__call");
 	luaL_setfuncs(L, reader, 1);
 
